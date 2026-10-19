@@ -1,0 +1,82 @@
+name: Build APK from ZIP
+
+# Upload a .zip with the LingoSnap project into the repo root -> APK is built in Actions.
+on:
+  push:
+    paths: ["*.zip"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unzip project
+        run: |
+          ZIP=$(ls -t ./*.zip | head -n 1)
+          echo "Building from: $ZIP"
+          mkdir -p "$RUNNER_TEMP/src"
+          unzip -q -o "$ZIP" -d "$RUNNER_TEMP/src"
+          SETTINGS=$(find "$RUNNER_TEMP/src" -name settings.gradle.kts -not -path "*/__MACOSX/*" | head -n 1)
+          [ -n "$SETTINGS" ] || { echo "No settings.gradle.kts found in ZIP"; exit 1; }
+          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+
+      - name: Build signed release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          gradle assembleRelease --no-daemon --console=plain 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # On failure: show the real errors at the top of the run page (Annotations + Summary)
+      - name: Show errors
+        if: failure()
+        run: |
+          LOG="$RUNNER_TEMP/build.log"
+          [ -f "$LOG" ] || exit 0
+          {
+            echo "## Build errors"
+            echo '```'
+            grep -E '^e: |^w: .*error|error:|What went wrong|Execution failed|Could not |Unresolved reference|Caused by:' "$LOG" | head -n 40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^e: |What went wrong|Execution failed|Could not ' "$LOG" | head -n 10 | while read -r line; do
+            echo "::error::${line:0:500}"
+          done
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp "$PROJECT_DIR"/app/build/outputs/apk/release/*.apk "out/LingoSnap-${{ github.run_number }}.apk"
+
+      # GitHub zips artifacts automatically: Actions -> run -> Artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LingoSnap-APK-${{ github.run_number }}
+          path: out/*.apk
+          if-no-files-found: error
+
+      # Upload build log if the build fails
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
